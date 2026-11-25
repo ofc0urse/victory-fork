@@ -965,8 +965,12 @@ extern "system" fn copy_texture_region(
 ) {
     #[cfg(windows)]
     {
-        use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_BOX, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_TEXTURE_COPY_LOCATION,
+        };
         use windows::core::Interface;
+        const SUBRESOURCE: u32 = 0;
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
         let (Some(list), Some(&dst), Some(&src)) =
@@ -1024,6 +1028,11 @@ extern "system" fn copy_texture_region(
                 None => return,
             }
         }
+        let dst_subresource = dst.footprint.offset as u32;
+        let same_reduced_texture = src.kind == SUBRESOURCE
+            && dst.kind == SUBRESOURCE
+            && src.resource == dst.resource
+            && crate::resource::dropped(src.resource) > 0;
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -1061,6 +1070,9 @@ extern "system" fn copy_texture_region(
                     None => return,
                 }
             }
+            if same_reduced_texture && from.footprint.offset as u32 == dst_subresource {
+                return;
+            }
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
@@ -1075,8 +1087,12 @@ extern "system" fn copy_texture_region(
         // of this list (`crate::tiles`): the title's bake copies each level
         // of its result into a block-compressed texture of that kind, and
         // a copy into a level without memory is dropped.
-        crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
-        ensure_state(list, dst.resource, COPY_DEST);
+        crate::texture::card_writes(list, dst.resource, to, Some(dst_subresource));
+        // The same reduced texture already has COPY_SOURCE as its tracked
+        // state. Change just its destination subresource around the copy.
+        if !same_reduced_texture {
+            ensure_state(list, dst.resource, COPY_DEST);
+        }
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
@@ -1108,6 +1124,14 @@ extern "system" fn copy_texture_region(
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
+            if same_reduced_texture {
+                list.list.ResourceBarrier(&[crate::host::transition_subresource(
+                    to,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    dst_subresource,
+                )]);
+            }
             list.list.CopyTextureRegion(
                 (&raw const to_location).cast(),
                 x,
@@ -1115,7 +1139,15 @@ extern "system" fn copy_texture_region(
                 z,
                 (&raw const from).cast(),
                 host_box,
-            )
+            );
+            if same_reduced_texture {
+                list.list.ResourceBarrier(&[crate::host::transition_subresource(
+                    to,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    dst_subresource,
+                )]);
+            }
         };
     }
     #[cfg(not(windows))]

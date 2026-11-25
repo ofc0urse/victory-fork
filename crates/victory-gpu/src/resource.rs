@@ -3526,6 +3526,189 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a D3D12 device and VICTORY_TEXTURE_DROP_MIPS=1"]
+    fn copies_between_retained_slices_of_one_texture() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+
+        let host = crate::host::host().expect("D3D12 device");
+        let null = std::ptr::null();
+        let desc = ResourceDesc {
+            depth_or_array_size: 2,
+            ..texture(512, 512, 28, 3)
+        };
+        let mut image = null;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                0x400,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut image
+            ),
+            S_OK
+        );
+        assert_eq!(dropped(image), 1, "enable one dropped mip");
+        let native_image = host_resource(image).unwrap();
+        // Mip 1 from each slice survives at host indices 0 and 2.
+        const HOST_SLICES: [u64; 2] = [0, 2];
+        const SLOT: usize = 1024;
+        const PITCH: usize = 256;
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let box_4x4 = D3D12_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: 4,
+            bottom: 4,
+            back: 1,
+        };
+        let location = |resource, kind, offset| Location {
+            resource,
+            kind,
+            footprint: PlacedFootprint {
+                offset,
+                format: 28,
+                width: 4,
+                height: 4,
+                depth: 1,
+                row_pitch: PITCH as u32,
+            },
+        };
+        let native = |resource: &ID3D12Resource| resource.as_raw().cast_const().cast();
+        let copy_native = |list: &crate::host::HostList, to: Location, from: Location, source_box| {
+            // SAFETY: these locations name live resources in the D3D12 layout.
+            unsafe {
+                list.list.CopyTextureRegion(
+                    (&raw const to).cast(),
+                    0,
+                    0,
+                    0,
+                    (&raw const from).cast(),
+                    source_box,
+                )
+            };
+        };
+        let (upload, data) = host.upload_buffer((2 * SLOT) as u64).unwrap();
+        let seed = host.new_list().unwrap();
+        for (slot, (subresource, byte)) in HOST_SLICES.into_iter().zip([0x6c, 0x17]).enumerate() {
+            let offset = slot * SLOT;
+            // SAFETY: the upload mapping holds two footprints of SLOT bytes.
+            unsafe { data.add(offset).write_bytes(byte, SLOT) };
+            copy_native(
+                &seed,
+                location(native(native_image), 0, subresource),
+                location(native(&upload), 1, offset as u64),
+                None,
+            );
+        }
+        seed.close();
+        host.execute(&[&seed]);
+        crate::texture::host_written(image);
+
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+        type Copy =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const D3D12_BOX);
+        let copy = slot::<Copy>(list, 0x80);
+        let tracked = crate::list::host_list(list).unwrap();
+        let source = location(image, 0, 1);
+        let destination = location(image, 0, 4);
+        assert!(tracked.transition(image, 0x800).is_none());
+        copy(list, &destination, 0, 0, 0, &source, &box_4x4);
+        // Check before submission so the control never executes an invalid copy.
+        assert!(
+            tracked.transition(image, 0x800).is_none(),
+            "a same-texture copy must restore the whole texture's source state"
+        );
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        host.execute(&[tracked]);
+
+        let readback = host.read_back_buffer((2 * SLOT) as u64).unwrap();
+        let read = host.new_list().unwrap();
+        for (slot, subresource) in HOST_SLICES.into_iter().enumerate() {
+            copy_native(
+                &read,
+                location(native(&readback), 1, (slot * SLOT) as u64),
+                location(native(native_image), 0, subresource),
+                Some(&box_4x4),
+            );
+        }
+        read.close();
+        host.execute(&[&read]);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copies finished and the mapping holds two footprints.
+        let data = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 2 * SLOT)
+        };
+        let pixels = [0, 1].map(|slot| {
+            [0, 1, 2, 3].map(|row| {
+                let start = slot * SLOT + row * PITCH;
+                <[u8; 16]>::try_from(&data[start..start + 16]).unwrap()
+            })
+        });
+        // SAFETY: the mapping is no longer used.
+        unsafe { readback.Unmap(0, None) };
+        // An invalid self-copy on one subresource must leave an unsubmitted
+        // list in its original state.
+        let mut rejected = null;
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut rejected),
+            S_OK
+        );
+        let tracked = crate::list::host_list(rejected).unwrap();
+        assert!(tracked.transition(image, 0x400).is_none());
+        copy(rejected, &source, 0, 0, 0, &source, &box_4x4);
+        assert!(
+            tracked.transition(image, 0x400).is_none(),
+            "same-subresource copy must leave the list alone"
+        );
+        let release = |object: This| slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        for object in [rejected, list, allocator, image] {
+            release(object);
+        }
+        assert_eq!(pixels[0], [[0x6c; 16]; 4], "source slice stays intact");
+        assert_eq!(
+            pixels[1], [[0x6c; 16]; 4],
+            "destination slice gets source bytes"
+        );
+    }
+
     /// A 16-bit depth texture the title also asks unordered access for gets
     /// a colour twin, and the host copies one into the other, both ways: a
     /// pattern put into the twin is copied to the depth texture, the twin
